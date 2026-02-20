@@ -8,8 +8,9 @@ Ship in small, safe increments. Each phase must be fully stable before moving to
 
 ## Current Status
 - Phase 1: Completed
-- Phase 2: Completed (AE-style bottom timeline shell in Animate, no keyframes yet)
-- Next: Phase 3
+- Phase 2: Completed (Animate mode has full-width timeline shell + merged layer timeline rows)
+- Phase 3: Completed (keyframe data model + write/overwrite path)
+- Next: Phase 4 (track rendering from actual keyframe data)
 
 ## New Product Requirements Added
 - Add a `Preview` action to test real scroll behavior as an end-user would experience it.
@@ -81,14 +82,14 @@ Initial plan: implement **A first**, then evaluate B later.
 
 ---
 
-## Phase 1: Mode System + Camera Contract (No Timeline Yet)
+## Phase 1: Mode System + Camera Contract (Completed)
 ### Scope
 - Add global mode toggle: `Orbit` / `Animate`.
-- Edit mode:
+- Orbit mode:
   - orbit/pan/zoom enabled.
 - Animate mode:
   - orbit/pan/zoom disabled.
-  - camera uses captured authored view from Edit mode.
+  - camera uses captured authored view from Orbit mode.
 - Auto-capture on switch to Animate.
 
 ### Exit Criteria
@@ -97,55 +98,60 @@ Initial plan: implement **A first**, then evaluate B later.
 
 ---
 
-## Phase 2: Timeline Shell + VH Length (Read-Only)
+## Phase 2: Timeline Shell + VH Length (Completed)
 ### Scope
-- Add AE-style bottom timeline shell.
+- Add full-width AE-style timeline shell in Animate mode.
 - Add `timelineLengthVh` input.
-- Add read-only playhead based on page scroll.
+- Add read-only playhead position.
 - Display current timeline position (`vh` + normalized progress).
-- In Animate mode, merge layer listing into timeline area.
-- Hide left Layers accordion in Animate mode.
-- Do not add artificial page spacer yet (Preview phase will handle runtime scroll simulation).
+- Merge layer listing with timeline rows.
+- Keep layers/modifier hierarchy legible (indent + shading + guides).
 
 ### Exit Criteria
-- Scroll maps correctly to timeline position for multiple `vh` lengths.
+- Timeline shell is stable and scalable (zoom + resize).
+- Layer hierarchy is readable and modifier rows are accessible.
 
 ---
 
-## Phase 3: Keyframe Data Model + Write Path Only
+## Phase 3: Keyframe Data Model + Write Path Only (Completed)
 ### Scope
-- Add track/keyframe data structures.
-- Add keyframe icon per animatable property in Layers pane.
-- Clicking icon writes/overwrites keyframe at current timeline position.
+- Add in-memory keyframe track model:
+  - `layerId`
+  - `propertyId`
+  - ordered `keyframes[]` with `{ atVh, value }`
+- Add keyframe icon per modifier row in timeline.
+- Clicking keyframe icon writes or overwrites at current timeline position.
+- Add indicator state for keyframed properties.
 
 ### Exit Criteria
-- Keyframes persist in memory and survive mode switches.
+- Keyframes persist in state across mode switches.
 - Overwrite at same timeline position works reliably.
+- No playback interpolation yet.
 
 ---
 
-## Phase 4: Timeline Track Rendering (Visual Only)
+## Phase 4: Timeline Track Rendering (Visual from Real Keyframes)
 ### Scope
-- Show only active tracks.
-- Render keyframe markers on timeline.
-- Marker selection state only (no drag yet).
+- Render true keyframe markers in track lanes from stored keyframe data.
+- Show only active property tracks with keyframes (or provide filter).
+- Keep marker selection state only (no drag yet).
 
 ### Exit Criteria
-- Track visibility rules are correct.
 - Marker positions match `atVh` precisely.
+- Marker visibility reflects actual stored data.
 
 ---
 
 ## Phase 5: Playback Engine (Linear Interpolation + End State)
 ### Scope
-- Evaluate keyframes from scroll position.
+- Evaluate keyframes from timeline position.
 - Apply interpolated values in Animate mode.
 - Enforce completion behavior:
   - hold final state at end
-  - reverse when scrolling back
+  - reverse when moving back
 
 ### Exit Criteria
-- Scroll drives deterministic animation.
+- Timeline position deterministically drives animated values.
 - End-of-animation behavior matches definition.
 
 ---
@@ -155,7 +161,7 @@ Initial plan: implement **A first**, then evaluate B later.
 - Add `Preview` button.
 - Enter runtime-like preview state:
   - editing controls disabled/hidden
-  - scroll drives timeline exactly like production behavior
+  - real page scroll drives timeline exactly like production behavior
 - Add `Exit Preview`.
 
 ### Exit Criteria
@@ -231,18 +237,3 @@ Initial plan: implement **A first**, then evaluate B later.
 
 ### Exit Criteria
 - Stable experience for normal production usage.
-
----
-
-## Recommended Build Order (Strict)
-1. Phase 1
-2. Phase 2
-3. Phase 3
-4. Phase 4
-5. Phase 5
-6. Phase 6
-7. Phase 7
-8. Phase 8
-9. Phase 9
-10. Phase 11
-11. Phase 10 (optional branch)
