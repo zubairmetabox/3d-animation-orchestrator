@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Canvas, useFrame } from "@react-three/fiber";
-import { Bounds, Center, OrbitControls, PerspectiveCamera } from "@react-three/drei";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
+import { Bounds, Center, OrbitControls, PerspectiveCamera, TransformControls } from "@react-three/drei";
+import { EffectComposer, Outline } from "@react-three/postprocessing";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import {
@@ -35,6 +36,7 @@ import {
   X,
   ZoomIn,
   ZoomOut,
+  Move,
 } from "lucide-react";
 import * as THREE from "three";
 import type {
@@ -89,7 +91,7 @@ type ExportConfig = {
   useAmbientLight: boolean;
   ambientIntensity: number;
   pointLights: { color: string; intensity: number; x: number; y: number; z: number }[];
-  pinnedCamera: { position: [number, number, number]; target: [number, number, number]; fov: number } | null;
+  pinnedCamera: { position: [number, number, number]; target: [number, number, number]; fov: number; zoom: number } | null;
   timelineLengthVh: number;
   tracks: { layerName: string; propertyId: string; keyframes: { atVh: number; value: number; easing: string }[] }[];
 };
@@ -144,7 +146,7 @@ type AnimationTrack = {
   keyframes: AnimationKeyframe[];
 };
 
-type ViewMode = "navigate" | "animate" | "preview";
+type ViewMode = "animate" | "preview";
 
 type CameraView = {
   position: [number, number, number];
@@ -312,13 +314,15 @@ scene.background = new THREE.Color(CFG.backgroundColor);
 
 const camera = new THREE.PerspectiveCamera(
   CFG.pinnedCamera ? CFG.pinnedCamera.fov : 45,
-  window.innerWidth / window.innerHeight, 0.01, 1000
+  window.innerWidth / window.innerHeight, 0.001, 100000
 );
 if (CFG.pinnedCamera) {
   const p = CFG.pinnedCamera.position;
   const t = CFG.pinnedCamera.target;
   camera.position.set(p[0], p[1], p[2]);
   camera.lookAt(new THREE.Vector3(t[0], t[1], t[2]));
+  camera.zoom = CFG.pinnedCamera.zoom != null ? CFG.pinnedCamera.zoom : 1;
+  camera.updateProjectionMatrix();
 }
 
 if (CFG.useAmbientLight) {
@@ -421,6 +425,16 @@ function applyTracks() {
 const loader = new GLTFLoader();
 loader.load(GLB_DATA_URL, function(gltf) {
   scene.add(gltf.scene);
+
+  // Centre at world origin — matches Drei's <Center> in the editor so
+  // the saved camera target [0,0,0] points at the model correctly.
+  var box = new THREE.Box3().setFromObject(gltf.scene);
+  if (!box.isEmpty()) {
+    var center = box.getCenter(new THREE.Vector3());
+    gltf.scene.position.sub(center);
+    gltf.scene.updateMatrixWorld(true);
+  }
+
   gltf.scene.traverse(function(obj) {
     if (obj.name) objMap[obj.name] = obj;
   });
@@ -483,6 +497,104 @@ function SceneGrid({
   if (!show) return null;
 
   return <gridHelper ref={gridRef} args={[size, divisions, "#748197", "#2d3642"]} position={[0, -1.2, 0]} />;
+}
+
+// Renders an orange wireframe box around a snap target while snapping is active.
+function MoveGizmo({
+  object,
+  onDragStart,
+  onDragMove,
+  onDragEnd,
+}: {
+  object: THREE.Object3D | null;
+  onDragStart: () => void;
+  onDragMove: () => void;
+  onDragEnd: () => void;
+}) {
+  const startRef = useRef(onDragStart);
+  const moveRef  = useRef(onDragMove);
+  const endRef   = useRef(onDragEnd);
+  useLayoutEffect(() => {
+    startRef.current = onDragStart;
+    moveRef.current  = onDragMove;
+    endRef.current   = onDragEnd;
+  });
+
+  // Pivot: a dummy group positioned at the object's bounding-box centre.
+  // TransformControls attaches to this so the gizmo always appears on the mesh.
+  const [pivot, setPivot] = useState<THREE.Group | null>(null);
+  const isDragging       = useRef(false);
+  const pivotStartPos    = useRef(new THREE.Vector3());
+  const objStartWorldPos = useRef(new THREE.Vector3());
+
+  useFrame(() => {
+    if (!pivot || !object || isDragging.current) return;
+    const box = new THREE.Box3().setFromObject(object);
+    if (box.isEmpty()) object.getWorldPosition(pivot.position);
+    else               box.getCenter(pivot.position);
+  });
+
+  if (!object) return null;
+
+  return (
+    <>
+      <group ref={setPivot} />
+      {pivot && (
+        <TransformControls
+          object={pivot}
+          mode="translate"
+          onMouseDown={() => {
+            isDragging.current = true;
+            pivotStartPos.current.copy(pivot.position);
+            object.getWorldPosition(objStartWorldPos.current);
+            startRef.current();
+          }}
+          onChange={() => {
+            if (!isDragging.current) return;
+            const worldDelta = new THREE.Vector3().subVectors(pivot.position, pivotStartPos.current);
+            const targetWorld = objStartWorldPos.current.clone().add(worldDelta);
+            if (object.parent) {
+              object.position.copy(object.parent.worldToLocal(targetWorld));
+            } else {
+              object.position.copy(targetWorld);
+            }
+            object.updateMatrixWorld();
+            moveRef.current();
+          }}
+          onMouseUp={() => {
+            isDragging.current = false;
+            endRef.current();
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+function SelectionOutline({ object }: { object: THREE.Object3D | null }) {
+  const meshes = useMemo(() => {
+    if (!object) return [];
+    const result: THREE.Mesh[] = [];
+    object.traverse((child) => {
+      if ((child as THREE.Mesh).isMesh) result.push(child as THREE.Mesh);
+    });
+    return result;
+  }, [object]);
+
+  if (!meshes.length) return null;
+
+  return (
+    <EffectComposer autoClear={false}>
+      <Outline
+        selection={meshes}
+        edgeStrength={5}
+        visibleEdgeColor={0x818cf8}
+        hiddenEdgeColor={0x818cf8}
+        pulseSpeed={0}
+        blur={false}
+      />
+    </EffectComposer>
+  );
 }
 
 function SliderField({
@@ -883,7 +995,6 @@ export function GlbViewer() {
   const [timelineProgress, setTimelineProgress] = useState(0);
   const [timelineZoom, setTimelineZoom] = useState(1);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [hasMovedInNavigate, setHasMovedInNavigate] = useState(false);
   const [timelineExpandedLayerIds, setTimelineExpandedLayerIds] = useState<Set<string>>(new Set());
   const [timelinePanelHeight, setTimelinePanelHeight] = useState(260);
   const [animationTracks, setAnimationTracks] = useState<AnimationTrack[]>([]);
@@ -900,6 +1011,11 @@ export function GlbViewer() {
   const [pointLights, setPointLights] = useState<PointLightConfig[]>([createDefaultPointLight(0)]);
   const [layerItems, setLayerItems] = useState<LayerItem[]>([]);
   const [selectedLayerId, setSelectedLayerId] = useState<string | null>(null);
+  // Isolation stack: array of group UUIDs from outermost to deepest.
+  // Empty = at scene root. Last entry = the group currently being edited inside.
+  const [isolationStack, setIsolationStack] = useState<string[]>([]);
+  const isolationStackRef = useRef<string[]>([]);
+  isolationStackRef.current = isolationStack; // mirror — always fresh in event handlers
   const [layerContextMenu, setLayerContextMenu] = useState<{
     layerId: string;
     x: number;
@@ -912,6 +1028,7 @@ export function GlbViewer() {
   } | null>(null);
   const [hoveredKfId, setHoveredKfId] = useState<string | null>(null);
   const [retimeIndicatorVh, setRetimeIndicatorVh] = useState<number | null>(null);
+  const [moveToolActive, setMoveToolActive] = useState(false);
   const [renamingLayerId, setRenamingLayerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [layerDetailsOpen, setLayerDetailsOpen] = useState<Record<string, boolean>>({});
@@ -1104,14 +1221,14 @@ export function GlbViewer() {
     return object?.name?.trim() || "Layer";
   };
 
-  // Re-apply pinned camera view in animate mode whenever it changes (e.g. after JSON load).
+  // Re-apply pinned camera view when it changes (e.g. after JSON load).
   // Using requestAnimationFrame ensures we run after Bounds' fit animation frame.
   useEffect(() => {
-    if (!hasModel || !pinnedCameraView || viewMode !== "animate") return;
+    if (!hasModel || !pinnedCameraView) return;
     const id = requestAnimationFrame(() => applyCameraView(pinnedCameraView));
     return () => cancelAnimationFrame(id);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pinnedCameraView, hasModel, viewMode]);
+  }, [pinnedCameraView, hasModel]);
 
   useEffect(() => {
     if (!hasUnsavedChanges) return;
@@ -1888,6 +2005,52 @@ export function GlbViewer() {
     setSelectedLayerId(layerId);
   };
 
+  // Given the nearest intersected Three.js object from an R3F click event,
+  // walk up the parent chain to find the direct child of the current
+  // isolation context root. Returns its UUID, or null if not selectable.
+  const resolveClickedLayer = (clickedObject: THREE.Object3D): string | null => {
+    if (!modelScene) return null;
+    const contextId = isolationStackRef.current[isolationStackRef.current.length - 1] ?? null;
+    const contextRoot: THREE.Object3D = contextId
+      ? (layerObjectMapRef.current.get(contextId) ?? modelScene)
+      : modelScene;
+
+    let target: THREE.Object3D = clickedObject;
+    while (target.parent && target.parent !== contextRoot) {
+      target = target.parent;
+    }
+    if (target.parent !== contextRoot) return null;
+    if (!isTransformableLayer(target)) return null;
+    if (deletedLayerIdsRef.current.has(target.uuid)) return null;
+    if (!layerObjectMapRef.current.has(target.uuid)) return null;
+    return target.uuid;
+  };
+
+  const handleMeshClick = (event: ThreeEvent<MouseEvent>) => {
+    event.stopPropagation();
+    const id = resolveClickedLayer(event.object);
+    if (id) selectLayer(id);
+  };
+
+  const handleMeshDoubleClick = (event: ThreeEvent<MouseEvent>) => {
+    event.stopPropagation();
+    const id = resolveClickedLayer(event.object);
+    if (!id) return;
+    const obj = layerObjectMapRef.current.get(id);
+    if (!obj) return;
+    // Enter isolation only if the group contains transformable children
+    if (!obj.children.some(isTransformableLayer)) return;
+    setIsolationStack((prev) => [...prev, id]);
+    setSelectedLayerId(null);
+  };
+
+  const handleCanvasPointerMissed = () => {
+    if (isolationStackRef.current.length > 0) {
+      setIsolationStack((prev) => prev.slice(0, -1));
+    }
+    setSelectedLayerId(null);
+  };
+
   const loadFile = async (file: File) => {
     if (!file.name.toLowerCase().endsWith(".glb")) {
       setErrorMessage("Please choose a valid .glb file.");
@@ -1920,6 +2083,7 @@ export function GlbViewer() {
           setLayerItems(items);
           layerObjectMapRef.current = objectMap;
           setSelectedLayerId(null);
+          setIsolationStack([]);
           setRenamingLayerId(null);
           setRenameValue("");
           setLayerDetailsOpen({});
@@ -2159,7 +2323,7 @@ export function GlbViewer() {
             .filter((l) => l.enabled)
             .map((l) => ({ color: l.color, intensity: l.intensity, x: l.x, y: l.y, z: l.z })),
           pinnedCamera: pinnedCameraView
-            ? { position: pinnedCameraView.position, target: pinnedCameraView.target, fov: pinnedCameraView.fov }
+            ? { position: pinnedCameraView.position, target: pinnedCameraView.target, fov: pinnedCameraView.fov, zoom: pinnedCameraView.zoom }
             : null,
           timelineLengthVh,
           tracks: animationTracks.map((t) => ({
@@ -2366,6 +2530,7 @@ export function GlbViewer() {
     setHistoryIndex(index);
     applyLayerSnapshot(entry.snapshot);
     setAnimationTracks(entry.tracks ?? []);
+    setIsolationStack([]);
   };
 
   const undoLayerChange = () => {
@@ -2383,37 +2548,20 @@ export function GlbViewer() {
   };
 
   const enterAnimateMode = () => {
-    if (pinnedCameraView) {
-      applyCameraView(pinnedCameraView);
-    }
     setViewMode("animate");
   };
 
   const enterPreviewMode = () => {
     if (!hasModel) return;
     setIsPlaying(false);
+    setMoveToolActive(false);
+    setIsolationStack([]);
+    if (pinnedCameraView) applyCameraView(pinnedCameraView);
     setViewMode("preview");
   };
 
   const exitPreviewMode = () => {
     setViewMode("animate");
-  };
-
-  const enterNavigateMode = () => {
-    if (viewMode === "navigate") return; // already here — don't re-capture or reset
-    // Capture the camera exactly as the user sees it now — Bounds fly-in is long done at this point
-    const controls = orbitControlsRef.current;
-    const camera = cameraRef.current;
-    if (controls && camera) {
-      setPinnedCameraView({
-        position: [camera.position.x, camera.position.y, camera.position.z],
-        target: [controls.target.x, controls.target.y, controls.target.z],
-        fov: camera.fov,
-        zoom: camera.zoom,
-      });
-    }
-    setHasMovedInNavigate(false);
-    setViewMode("navigate");
   };
 
   useEffect(() => {
@@ -2440,9 +2588,13 @@ export function GlbViewer() {
       const key = event.key.toLowerCase();
       const mod = event.ctrlKey || event.metaKey;
 
-      if (key === "escape" && viewMode === "preview") {
-        exitPreviewMode();
-        return;
+      if (key === "escape") {
+        if (isolationStackRef.current.length > 0) {
+          setIsolationStack((prev) => prev.slice(0, -1));
+          setSelectedLayerId(null);
+          return;
+        }
+        if (viewMode === "preview") { exitPreviewMode(); return; }
       }
 
       if (key === " " && viewMode === "animate") {
@@ -2567,10 +2719,15 @@ export function GlbViewer() {
         togglePlayRef.current();
         return;
       }
+      if (key === "g" && selectedLayerId) {
+        event.preventDefault();
+        setMoveToolActive((prev) => !prev);
+        return;
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [viewMode, selectedKfIds, animationTracks, timelineCurrentVh, timelineLengthVh, stepVhBackward, stepVhForward]);
+  }, [viewMode, selectedKfIds, animationTracks, timelineCurrentVh, timelineLengthVh, stepVhBackward, stepVhForward, selectedLayerId]);
 
   const deleteLayer = (layerId: string) => {
     const object = layerObjectMapRef.current.get(layerId);
@@ -2601,6 +2758,10 @@ export function GlbViewer() {
     if (selectedLayerId && idsToDelete.includes(selectedLayerId)) {
       setSelectedLayerId(null);
     }
+    setIsolationStack((prev) => {
+      const next = prev.filter((id) => !idsToDelete.includes(id));
+      return next.length !== prev.length ? next : prev;
+    });
     if (renamingLayerId && idsToDelete.includes(renamingLayerId)) {
       setRenamingLayerId(null);
       setRenameValue("");
@@ -2659,6 +2820,7 @@ export function GlbViewer() {
     const layerItem = layerItemsRef.current.find((l) => l.id === layerId);
     if (!layerItem || layerItem.parentId === null) return;
     modelScene.attach(obj);
+    setIsolationStack((prev) => prev.filter((id) => id !== layerId));
     const { items, objectMap } = getLayerItems(modelScene);
     setLayerItems(items);
     layerObjectMapRef.current = objectMap;
@@ -3315,7 +3477,8 @@ export function GlbViewer() {
     >
       <div className="absolute inset-0">
         {hasModel ? (
-          <Canvas>
+          <>
+          <Canvas onPointerMissed={viewMode === "animate" ? handleCanvasPointerMissed : undefined}>
             <PerspectiveCamera
               ref={cameraRef}
               makeDefault
@@ -3347,32 +3510,105 @@ export function GlbViewer() {
             )}
 
             <SceneGrid
-              show={settings.showGrid && viewMode === "navigate"}
+              show={settings.showGrid && viewMode !== "preview"}
               size={20}
               divisions={20}
               fadeDistance={30}
             />
 
+            <SelectionOutline
+              object={selectedLayerId ? (layerObjectMapRef.current.get(selectedLayerId) ?? null) : null}
+            />
+
+            {moveToolActive && viewMode === "animate" && (
+              <MoveGizmo
+                object={selectedLayerId ? (layerObjectMapRef.current.get(selectedLayerId) ?? null) : null}
+                onDragStart={() => {
+                  if (selectedLayerId) beginLayerTransform(selectedLayerId);
+                }}
+                onDragMove={() => {
+                  if (selectedLayerId) syncLayerTransform(selectedLayerId);
+                }}
+                onDragEnd={() => {
+                  if (!selectedLayerId) return;
+                  commitLayerTransform(selectedLayerId);
+                }}
+              />
+            )}
+
             <Bounds fit clip={false} observe={false} margin={1.1}>
               <Center>
-                <primitive object={modelScene} dispose={null} />
+                <primitive
+                  object={modelScene}
+                  dispose={null}
+                  onClick={viewMode === "animate" ? handleMeshClick : undefined}
+                  onDoubleClick={viewMode === "animate" ? handleMeshDoubleClick : undefined}
+                />
               </Center>
             </Bounds>
             <OrbitControls
               ref={orbitControlsRef}
               makeDefault
-              enableDamping={viewMode === "navigate"}
+              enableDamping
               dampingFactor={0.1}
               minDistance={0.02}
               maxDistance={100000}
-              enabled={viewMode === "navigate"}
-              enableRotate={viewMode === "navigate"}
-              enablePan={viewMode === "navigate"}
-              enableZoom={viewMode === "navigate" && settings.orbitEnableZoom}
-              autoRotate={viewMode === "navigate" && settings.orbitAutoRotate}
-              onChange={() => { if (viewMode === "navigate") setHasMovedInNavigate(true); }}
+              enabled={viewMode !== "preview"}
+              enableRotate={viewMode !== "preview"}
+              enablePan={viewMode !== "preview"}
+              enableZoom={viewMode !== "preview" && settings.orbitEnableZoom}
+              autoRotate={viewMode !== "preview" && settings.orbitAutoRotate}
             />
           </Canvas>
+
+          {/* ── Isolation breadcrumb bar ─────────────────────────────────────────── */}
+          {hasModel && viewMode === "animate" && isolationStack.length > 0 ? (
+            <div
+              className="pointer-events-auto absolute left-1/2 top-3 z-[55] -translate-x-1/2
+                         flex items-center gap-1 rounded-lg border border-border/40
+                         bg-card/90 px-3 py-1.5 text-xs backdrop-blur-sm"
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                className="text-muted-foreground transition-colors hover:text-foreground"
+                onClick={() => { setIsolationStack([]); setSelectedLayerId(null); }}
+              >
+                Scene
+              </button>
+              {isolationStack.map((id, index) => {
+                const isLast = index === isolationStack.length - 1;
+                return (
+                  <span key={id} className="flex items-center gap-1">
+                    <ChevronRight className="h-3 w-3 text-muted-foreground/50" />
+                    {isLast ? (
+                      <span className="font-medium text-foreground">{getLayerName(id)}</span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="text-muted-foreground transition-colors hover:text-foreground"
+                        onClick={() => {
+                          setIsolationStack((prev) => prev.slice(0, index + 1));
+                          setSelectedLayerId(null);
+                        }}
+                      >
+                        {getLayerName(id)}
+                      </button>
+                    )}
+                  </span>
+                );
+              })}
+              <button
+                type="button"
+                className="ml-2 text-muted-foreground/50 transition-colors hover:text-foreground"
+                title="Exit isolation (Escape)"
+                onClick={() => { setIsolationStack([]); setSelectedLayerId(null); }}
+              >
+                ×
+              </button>
+            </div>
+          ) : null}
+          </>
         ) : (
           <div className="h-full bg-[#0b0f13]" />
         )}
@@ -3501,6 +3737,26 @@ export function GlbViewer() {
             )}
           </div>
 
+          {viewMode === "animate" && selectedLayerId ? (
+            <>
+              <div className="mx-1 h-4 w-px bg-border/60" />
+              <button
+                type="button"
+                title={moveToolActive ? "Move tool active — click or press G to deactivate" : "Move tool (G)"}
+                className={cn(
+                  "flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-sm font-medium transition-colors",
+                  moveToolActive
+                    ? "border-primary bg-primary/15 text-primary"
+                    : "border-transparent text-muted-foreground hover:border-border/50 hover:bg-muted/60 hover:text-foreground"
+                )}
+                onClick={() => setMoveToolActive((v) => !v)}
+              >
+                <Move className="h-3.5 w-3.5" />
+                Move
+              </button>
+            </>
+          ) : null}
+
           {layerMessage ? (
             <span className="pl-1 text-xs text-muted-foreground">{layerMessage}</span>
           ) : null}
@@ -3566,12 +3822,16 @@ export function GlbViewer() {
           className="absolute right-4 top-3 z-50 flex items-center gap-1 rounded-lg border border-border/40 bg-card/90 px-1 py-0.5 backdrop-blur-sm"
           onPointerDown={(e) => e.stopPropagation()}
         >
-          {viewMode === "navigate" ? (
+          {viewMode === "animate" ? (
             <Button
               size="sm"
-              variant="outline"
-              disabled={!hasMovedInNavigate}
-              className="border-primary/50 text-primary hover:bg-primary/10 disabled:opacity-40"
+              variant={pinnedCameraView ? "outline" : "secondary"}
+              className={
+                pinnedCameraView
+                  ? "border-primary/50 text-primary hover:bg-primary/10"
+                  : "text-muted-foreground"
+              }
+              title={pinnedCameraView ? "Update saved preview camera" : "Save current view as preview camera"}
               onClick={() => {
                 const controls = orbitControlsRef.current;
                 const camera = cameraRef.current;
@@ -3582,19 +3842,26 @@ export function GlbViewer() {
                   fov: camera.fov,
                   zoom: camera.zoom,
                 });
-                setHasMovedInNavigate(false);
               }}
             >
-              Pin View
+              <Camera className="mr-1.5 h-3.5 w-3.5" />
+              Set Preview Camera
             </Button>
           ) : null}
-          <Button
-            size="sm"
-            variant={viewMode === "navigate" ? "default" : "secondary"}
-            onClick={enterNavigateMode}
-          >
-            Navigate
-          </Button>
+          {viewMode === "animate" && pinnedCameraView ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 w-7 p-0 text-primary hover:bg-primary/10"
+              title="Return to saved preview angle"
+              onClick={() => applyCameraView(pinnedCameraView)}
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+            </Button>
+          ) : null}
+          {viewMode === "animate" ? (
+            <div className="mx-0.5 h-4 w-px bg-border/60" />
+          ) : null}
           <Button
             size="sm"
             variant={viewMode === "animate" ? "default" : "secondary"}
@@ -3606,6 +3873,7 @@ export function GlbViewer() {
             size="sm"
             variant="secondary"
             className="text-muted-foreground hover:text-foreground"
+            disabled={!hasModel}
             onClick={enterPreviewMode}
           >
             Preview
@@ -4077,7 +4345,11 @@ export function GlbViewer() {
                         </div>
 
                         {timelineRows.map((row) => (
-                          <div key={row.key} className="grid grid-cols-[320px_12px_1fr] border-b last:border-b-0">
+                          <div
+                            key={row.key}
+                            className="grid grid-cols-[320px_12px_1fr] border-b last:border-b-0"
+                            style={selectedLayerId === row.layer.id ? { boxShadow: "inset 3px 0 0 hsl(var(--primary))" } : undefined}
+                          >
                             {row.kind === "layer" ? (
                               <div
                                 data-layer-id={row.layer.id}
@@ -4371,7 +4643,9 @@ export function GlbViewer() {
                               )}
                               style={{
                                 backgroundColor:
-                                  row.kind === "layer"
+                                  selectedLayerId === row.layer.id
+                                    ? "hsl(var(--primary) / 0.08)"
+                                    : row.kind === "layer"
                                     ? `rgba(100, 116, 139, ${getDepthShade(row.layer.depth) * 0.85})`
                                     : `rgba(241, 245, 249, ${Math.max(0.12, getDepthShade(row.layer.depth) * 0.22)})`,
                               }}
